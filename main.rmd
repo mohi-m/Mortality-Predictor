@@ -1,0 +1,6 @@
+
+```{r}
+# load data from csv
+data = read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
+summary.data.frame(data)
+```
