@@ -1,6 +1,74 @@
+---
+title: "Illinois Death Analysis"
+author: "Mohi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Required Libraries
 
 ```{r}
-# load data from csv
-data = read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
-summary.data.frame(data)
+library(tidyverse)
+library(ggplot2)
+```
+
+## Load Dataset
+
+```{r}
+data <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
+
+# Rename columns to be shorter
+data <- data %>% rename(
+    Septicemia = Septicemia..A40.A41.,
+    Cancer = Malignant.neoplasms..C00.C97.,
+    Diabetes = Diabetes.mellitus..E10.E14.,
+    Alzheimer = Alzheimer.disease..G30.,
+    Flu_Pneumonia = Influenza.and.pneumonia..J09.J18.,
+    Respiratory_Disease = Chronic.lower.respiratory.diseases..J40.J47.,
+    Other_Respiratory = Other.diseases.of.respiratory.system..J00.J06.J30.J39.J67.J70.J98.,
+    Kidney_Disease = Nephritis..nephrotic.syndrome.and.nephrosis..N00.N07.N17.N19.N25.N27.,
+    Symptoms_Not_Classified = Symptoms..signs.and.abnormal.clinical.and.laboratory.findings..not.elsewhere.classified..R00.R99.,
+    Heart_Disease = Diseases.of.heart..I00.I09.I11.I13.I20.I51.,
+    Stroke = Cerebrovascular.diseases..I60.I69.,
+    COVID_Multiple = COVID.19..U071..Multiple.Cause.of.Death.,
+    COVID_Underlying = COVID.19..U071..Underlying.Cause.of.Death.
+)
+```
+
+## Filter Data for Illinois
+
+```{r}
+illinois_data <- data %>% filter(Jurisdiction.of.Occurrence == "Illinois")
+```
+
+## Plot "All Deaths" Over Time
+
+```{r}
+ggplot(illinois_data, aes(x = as.Date(Week.Ending.Date, format = "%Y-%m-%d"), y = All.Cause)) +
+    geom_line(color = "blue") +
+    labs(title = "All Deaths in Illinois Over Time", x = "Date", y = "Number of Deaths") +
+    theme_minimal()
+```
+
+## Plot Distribution of Causes of Death
+
+```{r}
+illinois_causes <- illinois_data %>%
+    select(
+        Septicemia, Cancer, Diabetes, Alzheimer, Flu_Pneumonia,
+        Respiratory_Disease, Other_Respiratory, Kidney_Disease,
+        Symptoms_Not_Classified, Heart_Disease, Stroke,
+        COVID_Multiple, COVID_Underlying
+    ) %>%
+    pivot_longer(cols = everything(), names_to = "Cause", values_to = "Count")
+
+ggplot(illinois_causes, aes(x = reorder(Cause, -Count), y = Count, fill = Cause)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    labs(title = "Distribution of Causes of Death in Illinois", x = "Cause of Death", y = "Number of Deaths") +
+    theme_minimal()
 ```
