@@ -5,7 +5,7 @@ library(readr)
 
 
 # Step 1: Read all CSV files and combine them
-file_list <- list.files(path = "C:/Users/rriya/OneDrive/Documents/temp/Mortality-Predictor/datasets/Climate datasets", pattern = "*.csv", full.names = TRUE)
+file_list <- list.files(path = "./datasets/Climate datasets", pattern = "*.csv", full.names = TRUE)
 df_list <- lapply(file_list, read_csv)
 df <- bind_rows(df_list)
 
