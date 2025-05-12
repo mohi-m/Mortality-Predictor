@@ -1,74 +1,242 @@
 ---
-title: "Illinois Death Analysis"
-author: "Mohi"
-date: "`r Sys.Date()`"
-output: html_document
+title: "COVID-19 Mortality and Climate Analysis"
+output: html_notebook
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
-
-## Load Required Libraries
-
-```{r}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 library(tidyverse)
-library(ggplot2)
+library(lubridate)
+library(corrplot)
+library(glmnet)
+library(caret)
+library(xgboost)
+library(prophet)
 ```
 
-## Load Dataset
+## Load and Clean Mortality Data
 
-```{r}
-data <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
+```{r clean-mortality-data}
+# Relevant columns
+relevant_mortality_columns <- c(
+  "Jurisdiction of Occurrence", "MMWR Year", "MMWR Week", "Week Ending Date",
+  "All Cause", "Natural Cause", "Septicemia (A40-A41)",
+  "Malignant neoplasms (C00-C97)", "Diabetes mellitus (E10-E14)",
+  "Alzheimer disease (G30)", "Influenza and pneumonia (J09-J18)",
+  "Chronic lower respiratory diseases (J40-J47)",
+  "Other diseases of respiratory system (J00-J06,J30-J39,J67,J70-J98)",
+  "Nephritis, nephrotic syndrome and nephrosis (N00-N07,N17-N19,N25-N27)",
+  "Symptoms, signs and abnormal clinical and laboratory findings, not elsewhere classified (R00-R99)",
+  "Diseases of heart (I00-I09,I11,I13,I20-I51)",
+  "Cerebrovascular diseases (I60-I69)",
+  "COVID-19 (U071, Multiple Cause of Death)",
+  "COVID-19 (U071, Underlying Cause of Death)"
+)
 
-# Rename columns to be shorter
-data <- data %>% rename(
-    Septicemia = Septicemia..A40.A41.,
-    Cancer = Malignant.neoplasms..C00.C97.,
-    Diabetes = Diabetes.mellitus..E10.E14.,
-    Alzheimer = Alzheimer.disease..G30.,
-    Flu_Pneumonia = Influenza.and.pneumonia..J09.J18.,
-    Respiratory_Disease = Chronic.lower.respiratory.diseases..J40.J47.,
-    Other_Respiratory = Other.diseases.of.respiratory.system..J00.J06.J30.J39.J67.J70.J98.,
-    Kidney_Disease = Nephritis..nephrotic.syndrome.and.nephrosis..N00.N07.N17.N19.N25.N27.,
-    Symptoms_Not_Classified = Symptoms..signs.and.abnormal.clinical.and.laboratory.findings..not.elsewhere.classified..R00.R99.,
-    Heart_Disease = Diseases.of.heart..I00.I09.I11.I13.I20.I51.,
-    Stroke = Cerebrovascular.diseases..I60.I69.,
-    COVID_Multiple = COVID.19..U071..Multiple.Cause.of.Death.,
-    COVID_Underlying = COVID.19..U071..Underlying.Cause.of.Death.
+mortality_dataset <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
+mortality_illinois <- mortality_dataset %>%
+  filter(`Jurisdiction of Occurrence` == "Illinois") %>%
+  select(all_of(relevant_mortality_columns)) %>%
+  mutate(`Week Ending Date` = ymd(`Week Ending Date`)) %>%
+  filter(`Week Ending Date` < ymd("2023-08-01")) %>%
+  mutate(`Non Covid Deaths` = `All Cause` - coalesce(`COVID-19 (U071, Underlying Cause of Death)`, 0))
+```
+
+## Load and Clean Climate Data
+
+```{r clean-climate-data}
+col_map <- c(
+  AWND = "Average Wind Speed (m/s)",
+  DAPR = "Number of days included in the multiday precipitation total",
+  MDPR = "Multiday precipitation total (mm)",
+  PRCP = "Precipitation (mm)", SNOW = "Snowfall (cm)",
+  SNWD = "Snow Depth (cm)", TAVG = "Average Temperature (C)",
+  TMAX = "Maximum Temperature (C)", TMIN = "Minimum Temperature (C)",
+  TOBS = "Temperature Observed (C)"
+)
+
+climate_dataset <- read.csv("datasets/Climate datasets/Data Cleaning/Climate_weekly_data.csv") %>%
+  select(Date = Week_Ending_Date, all_of(names(col_map))) %>%
+  rename_with(~ col_map[.x], .cols = names(col_map)) %>%
+  mutate(`Week Ending Date` = ymd(Date)) %>%
+  select(-Date)
+```
+
+## Merge Mortality and Climate Data
+
+```{r merge-data}
+merged_dataset <- inner_join(
+  mortality_illinois,
+  climate_dataset,
+  by = "Week Ending Date"
 )
 ```
 
-## Filter Data for Illinois
+## Visualize Features Over Time
 
-```{r}
-illinois_data <- data %>% filter(Jurisdiction.of.Occurrence == "Illinois")
+```{r visualize-features}
+features <- c(
+  "Average Wind Speed (m/s)",
+  "Number of days included in the multiday precipitation total",
+  "Multiday precipitation total (mm)", "Precipitation (mm)",
+  "Snowfall (cm)", "Snow Depth (cm)",
+  "Average Temperature (C)", "Maximum Temperature (C)",
+  "Minimum Temperature (C)", "Temperature Observed (C)"
+)
+
+# Pivot for ggplot
+long_df <- merged_dataset %>%
+  select(`Week Ending Date`, all_of(features), `Non Covid Deaths`) %>%
+  pivot_longer(-`Week Ending Date`, names_to = "Variable", values_to = "Value")
+
+# Plot with facets and secondary axis per facet is complex; here example for one:
+ggplot() +
+  geom_line(data = merged_dataset, aes(x = `Week Ending Date`, y = `Average Wind Speed (m/s)`)) +
+  geom_line(data = merged_dataset, aes(x = `Week Ending Date`, y = `Non Covid Deaths`/max(`Non Covid Deaths`)*max(`Average Wind Speed (m/s)`)), color = "red") +
+  labs(x = "Week Ending Date", y = "Average Wind Speed (scaled) and Deaths") +
+  theme_minimal()
 ```
 
-## Plot "All Deaths" Over Time
+## Correlation Heatmap
 
-```{r}
-ggplot(illinois_data, aes(x = as.Date(Week.Ending.Date, format = "%Y-%m-%d"), y = All.Cause)) +
-    geom_line(color = "blue") +
-    labs(title = "All Deaths in Illinois Over Time", x = "Date", y = "Number of Deaths") +
-    theme_minimal()
+```{r plot-correlation}
+numeric_cols <- c("Non Covid Deaths", features)
+corr_mat <- merged_dataset %>%
+  select(all_of(numeric_cols)) %>%
+  cor(use = "complete.obs")
+corrplot(corr_mat, method = "color", type = "upper", tl.cex = 0.8)
 ```
 
-## Plot Distribution of Causes of Death
+## Lasso Regression Modeling
 
-```{r}
-illinois_causes <- illinois_data %>%
-    select(
-        Septicemia, Cancer, Diabetes, Alzheimer, Flu_Pneumonia,
-        Respiratory_Disease, Other_Respiratory, Kidney_Disease,
-        Symptoms_Not_Classified, Heart_Disease, Stroke,
-        COVID_Multiple, COVID_Underlying
-    ) %>%
-    pivot_longer(cols = everything(), names_to = "Cause", values_to = "Count")
+```{r lasso-modeling}
+predictors <- c(
+  "Average Wind Speed (m/s)", "Snowfall (cm)", "Snow Depth (cm)",
+  "Average Temperature (C)",
+  # temperature range
+  sprintf("Temprature Range (C)")
+)
 
-ggplot(illinois_causes, aes(x = reorder(Cause, -Count), y = Count, fill = Cause)) +
-    geom_bar(stat = "identity") +
-    coord_flip() +
-    labs(title = "Distribution of Causes of Death in Illinois", x = "Cause of Death", y = "Number of Deaths") +
-    theme_minimal()
+# Add temperature range
+merged_dataset <- merged_dataset %>%
+  mutate(`Temprature Range (C)` = `Maximum Temperature (C)` - `Minimum Temperature (C)`)
+
+# Split
+data_split <- createDataPartition(merged_dataset$`Non Covid Deaths`, p = 0.8, list = FALSE)
+train_df <- merged_dataset[data_split, ]
+test_df  <- merged_dataset[-data_split, ]
+
+# Preprocess: scale
+preProc <- preProcess(train_df[, predictors], method = c("center", "scale"))
+X_train <- predict(preProc, train_df[, predictors])
+X_test  <- predict(preProc, test_df[, predictors])
+y_train <- train_df$`Non Covid Deaths`
+y_test  <- test_df$`Non Covid Deaths`
+
+# Polynomial features via model.matrix
+poly_formula <- as.formula(paste("~ (", paste(predictors, collapse = " + "), ")^2 -1"))
+X_train_poly <- model.matrix(poly_formula, data = X_train)
+X_test_poly  <- model.matrix(poly_formula, data = X_test)
+
+# Lasso CV
+cv_lasso <- cv.glmnet(
+  x = X_train_poly, y = y_train,
+  alpha = 1, nfolds = 5, parallel = FALSE
+)
+
+# Predictions
+y_train_pred <- predict(cv_lasso, X_train_poly, s = "lambda.min")
+y_test_pred  <- predict(cv_lasso, X_test_poly,  s = "lambda.min")
+
+# Metrics
+train_rmse <- sqrt(mean((y_train - y_train_pred)^2))
+test_rmse  <- sqrt(mean((y_test  - y_test_pred )^2))
+
+train_r2 <- cor(y_train, y_train_pred)^2
+test_r2  <- cor(y_test,  y_test_pred )^2
+
+train_rmse; test_rmse; train_r2; test_r2
 ```
+
+## Prophet Forecasting
+
+```{r prophet-model}
+prophet_df <- mortality_illinois %>%
+  select(ds = `Week Ending Date`, y = `Non Covid Deaths`) %>%
+  filter(y > 0, y < 10000)
+
+m <- prophet(prophet_df, yearly.seasonality = TRUE, weekly.seasonality = TRUE)
+future <- make_future_dataframe(m, periods = 52, freq = 'week')
+forecast <- predict(m, future)
+
+plot(m, forecast)
+prophet_plot_components(m, forecast)
+```
+
+## Cross-Validation for Prophet
+
+```{r prophet-cv}
+df_cv <- cross_validation(m, initial = 365, period = 30, horizon = 30, units = 'days')
+perf <- performance_metrics(df_cv)
+head(perf)
+```
+
+## XGBoost Modeling with Grid Search
+
+```{r xgb-tuning}
+# Prepare data matrices
+train_mat <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+test_mat  <- xgb.DMatrix(data = as.matrix(X_test),  label = y_test)
+
+# Grid
+param_grid <- expand.grid(
+  nrounds = c(100,200,300),
+  eta = c(0.05, 0.1),
+  max_depth = c(3,5,7),
+  subsample = c(0.8,1.0),
+  colsample_bytree = 1,
+  min_child_weight = 1
+)
+
+control <- trainControl(method = "cv", number = 5)
+
+xgb_train <- train(
+  x = X_train, y = y_train,
+  method = "xgbTree",
+  trControl = control,
+  tuneGrid = param_grid,
+  metric = "RMSE"
+)
+
+xgb_train$bestTune
+```
+
+## Final XGBoost Model and Evaluation
+
+```{r xgb-final}
+final_model <- xgb_train$finalModel
+
+y_train_xgb <- predict(final_model, X_train)
+y_test_xgb  <- predict(final_model, X_test)
+
+rmse(y_train, y_train_xgb)
+rmse(y_test,  y_test_xgb)
+r2(y_train, y_train_xgb)
+r2(y_test,  y_test_xgb)
+```
+
+## Feature Importance and Predictions Plotting
+
+```{r xgb-results}
+# Importance
+importance_matrix <- xgb.importance(feature_names = colnames(X_train), model = final_model)
+xgb.plot.importance(importance_matrix)
+
+# Predictions vs Actual
+plot_df <- merged_dataset %>%
+  mutate(pred_xgb = predict(final_model, as.matrix(predict(preProc, merged_dataset[, predictors]))))
+
+ggplot(plot_df) +
+  geom_line(aes(x = `Week Ending Date`, y = `Non Covid Deaths`), color = 'blue') +
+  geom_line(aes(x = `Week Ending Date`, y = pred_xgb), color = 'red') +
+  labs(title = 'XGBoost: Actual vs Predicted')
