@@ -33,11 +33,16 @@ relevant_mortality_columns <- c(
   "COVID-19 (U071, Underlying Cause of Death)"
 )
 
-mortality_dataset <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv")
+# Read and process mortality data
+mortality_dataset <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv", check.names = FALSE)
+
+# Convert Week Ending Date to Date format
+mortality_dataset <- mortality_dataset %>%
+  mutate(`Week Ending Date` = mdy(`Week Ending Date`))
+
 mortality_illinois <- mortality_dataset %>%
   filter(`Jurisdiction of Occurrence` == "Illinois") %>%
   select(all_of(relevant_mortality_columns)) %>%
-  mutate(`Week Ending Date` = ymd(`Week Ending Date`)) %>%
   filter(`Week Ending Date` < ymd("2023-08-01")) %>%
   mutate(`Non Covid Deaths` = `All Cause` - coalesce(`COVID-19 (U071, Underlying Cause of Death)`, 0))
 ```
@@ -58,7 +63,7 @@ col_map <- c(
 climate_dataset <- read.csv("datasets/Climate datasets/Data Cleaning/Climate_weekly_data.csv") %>%
   select(Date = Week_Ending_Date, all_of(names(col_map))) %>%
   rename_with(~ col_map[.x], .cols = names(col_map)) %>%
-  mutate(`Week Ending Date` = ymd(Date)) %>%
+  mutate("Week Ending Date" = ymd(Date)) %>%
   select(-Date)
 ```
 
@@ -86,13 +91,15 @@ features <- c(
 
 # Pivot for ggplot
 long_df <- merged_dataset %>%
-  select(`Week Ending Date`, all_of(features), `Non Covid Deaths`) %>%
-  pivot_longer(-`Week Ending Date`, names_to = "Variable", values_to = "Value")
+  select("Week Ending Date", all_of(features), "Non Covid Deaths") %>%
+  pivot_longer(-"Week Ending Date", names_to = "Variable", values_to = "Value")
 
 # Plot with facets and secondary axis per facet is complex; here example for one:
-ggplot() +
-  geom_line(data = merged_dataset, aes(x = `Week Ending Date`, y = `Average Wind Speed (m/s)`)) +
-  geom_line(data = merged_dataset, aes(x = `Week Ending Date`, y = `Non Covid Deaths`/max(`Non Covid Deaths`)*max(`Average Wind Speed (m/s)`)), color = "red") +
+scale_factor <- max(merged_dataset$`Average Wind Speed (m/s)`) / max(merged_dataset$`Non Covid Deaths`)
+
+ggplot(merged_dataset, aes(x = `Week Ending Date`)) +
+  geom_line(aes(y = `Average Wind Speed (m/s)`)) +
+  geom_line(aes(y = `Non Covid Deaths` * scale_factor), color = "red") +
   labs(x = "Week Ending Date", y = "Average Wind Speed (scaled) and Deaths") +
   theme_minimal()
 ```
@@ -101,9 +108,11 @@ ggplot() +
 
 ```{r plot-correlation}
 numeric_cols <- c("Non Covid Deaths", features)
-corr_mat <- merged_dataset %>%
+numeric_data <- merged_dataset %>%
   select(all_of(numeric_cols)) %>%
-  cor(use = "complete.obs")
+  drop_na() %>%
+  mutate(across(everything(), as.numeric))
+corr_mat <- cor(numeric_data, use = "pairwise.complete.obs")
 corrplot(corr_mat, method = "color", type = "upper", tl.cex = 0.8)
 ```
 
@@ -119,24 +128,24 @@ predictors <- c(
 
 # Add temperature range
 merged_dataset <- merged_dataset %>%
-  mutate(`Temprature Range (C)` = `Maximum Temperature (C)` - `Minimum Temperature (C)`)
+  mutate("Temprature Range (C)" = "Maximum Temperature (C)" - "Minimum Temperature (C)")
 
 # Split
 data_split <- createDataPartition(merged_dataset$`Non Covid Deaths`, p = 0.8, list = FALSE)
 train_df <- merged_dataset[data_split, ]
-test_df  <- merged_dataset[-data_split, ]
+test_df <- merged_dataset[-data_split, ]
 
 # Preprocess: scale
 preProc <- preProcess(train_df[, predictors], method = c("center", "scale"))
 X_train <- predict(preProc, train_df[, predictors])
-X_test  <- predict(preProc, test_df[, predictors])
+X_test <- predict(preProc, test_df[, predictors])
 y_train <- train_df$`Non Covid Deaths`
-y_test  <- test_df$`Non Covid Deaths`
+y_test <- test_df$`Non Covid Deaths`
 
 # Polynomial features via model.matrix
 poly_formula <- as.formula(paste("~ (", paste(predictors, collapse = " + "), ")^2 -1"))
 X_train_poly <- model.matrix(poly_formula, data = X_train)
-X_test_poly  <- model.matrix(poly_formula, data = X_test)
+X_test_poly <- model.matrix(poly_formula, data = X_test)
 
 # Lasso CV
 cv_lasso <- cv.glmnet(
@@ -146,27 +155,30 @@ cv_lasso <- cv.glmnet(
 
 # Predictions
 y_train_pred <- predict(cv_lasso, X_train_poly, s = "lambda.min")
-y_test_pred  <- predict(cv_lasso, X_test_poly,  s = "lambda.min")
+y_test_pred <- predict(cv_lasso, X_test_poly, s = "lambda.min")
 
 # Metrics
 train_rmse <- sqrt(mean((y_train - y_train_pred)^2))
-test_rmse  <- sqrt(mean((y_test  - y_test_pred )^2))
+test_rmse <- sqrt(mean((y_test - y_test_pred)^2))
 
 train_r2 <- cor(y_train, y_train_pred)^2
-test_r2  <- cor(y_test,  y_test_pred )^2
+test_r2 <- cor(y_test, y_test_pred)^2
 
-train_rmse; test_rmse; train_r2; test_r2
+train_rmse
+test_rmse
+train_r2
+test_r2
 ```
 
 ## Prophet Forecasting
 
 ```{r prophet-model}
 prophet_df <- mortality_illinois %>%
-  select(ds = `Week Ending Date`, y = `Non Covid Deaths`) %>%
+  select(ds = "Week Ending Date", y = "Non Covid Deaths") %>%
   filter(y > 0, y < 10000)
 
 m <- prophet(prophet_df, yearly.seasonality = TRUE, weekly.seasonality = TRUE)
-future <- make_future_dataframe(m, periods = 52, freq = 'week')
+future <- make_future_dataframe(m, periods = 52, freq = "week")
 forecast <- predict(m, future)
 
 plot(m, forecast)
@@ -176,7 +188,7 @@ prophet_plot_components(m, forecast)
 ## Cross-Validation for Prophet
 
 ```{r prophet-cv}
-df_cv <- cross_validation(m, initial = 365, period = 30, horizon = 30, units = 'days')
+df_cv <- cross_validation(m, initial = 365, period = 30, horizon = 30, units = "days")
 perf <- performance_metrics(df_cv)
 head(perf)
 ```
@@ -186,14 +198,14 @@ head(perf)
 ```{r xgb-tuning}
 # Prepare data matrices
 train_mat <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
-test_mat  <- xgb.DMatrix(data = as.matrix(X_test),  label = y_test)
+test_mat <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
 
 # Grid
 param_grid <- expand.grid(
-  nrounds = c(100,200,300),
+  nrounds = c(100, 200, 300),
   eta = c(0.05, 0.1),
-  max_depth = c(3,5,7),
-  subsample = c(0.8,1.0),
+  max_depth = c(3, 5, 7),
+  subsample = c(0.8, 1.0),
   colsample_bytree = 1,
   min_child_weight = 1
 )
@@ -217,12 +229,12 @@ xgb_train$bestTune
 final_model <- xgb_train$finalModel
 
 y_train_xgb <- predict(final_model, X_train)
-y_test_xgb  <- predict(final_model, X_test)
+y_test_xgb <- predict(final_model, X_test)
 
 rmse(y_train, y_train_xgb)
-rmse(y_test,  y_test_xgb)
+rmse(y_test, y_test_xgb)
 r2(y_train, y_train_xgb)
-r2(y_test,  y_test_xgb)
+r2(y_test, y_test_xgb)
 ```
 
 ## Feature Importance and Predictions Plotting
@@ -237,6 +249,7 @@ plot_df <- merged_dataset %>%
   mutate(pred_xgb = predict(final_model, as.matrix(predict(preProc, merged_dataset[, predictors]))))
 
 ggplot(plot_df) +
-  geom_line(aes(x = `Week Ending Date`, y = `Non Covid Deaths`), color = 'blue') +
-  geom_line(aes(x = `Week Ending Date`, y = pred_xgb), color = 'red') +
-  labs(title = 'XGBoost: Actual vs Predicted')
+  geom_line(aes(x = "Week Ending Date", y = "Non Covid Deaths"), color = "blue") +
+  geom_line(aes(x = "Week Ending Date", y = pred_xgb), color = "red") +
+  labs(title = "XGBoost: Actual vs Predicted")
+```
