@@ -4,7 +4,22 @@ output: html_notebook
 ---
 
 ```{r setup, include=FALSE}
+# Global chunk options
 knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Install any missing packages
+required_packages <- c(
+  "tidyverse","lubridate","corrplot","glmnet",
+  "caret","xgboost","prophet","future"
+)
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Load libraries
+library(future)
 library(tidyverse)
 library(lubridate)
 library(corrplot)
@@ -17,7 +32,11 @@ library(prophet)
 ## Load and Clean Mortality Data
 
 ```{r clean-mortality-data}
-# Relevant columns
+# File path to mortality data
+mortality_path <- "datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv"
+
+# Read and preprocess
+mortality_dataset <- read_csv(mortality_path)
 relevant_mortality_columns <- c(
   "Jurisdiction of Occurrence", "MMWR Year", "MMWR Week", "Week Ending Date",
   "All Cause", "Natural Cause", "Septicemia (A40-A41)",
@@ -33,43 +52,49 @@ relevant_mortality_columns <- c(
   "COVID-19 (U071, Underlying Cause of Death)"
 )
 
-# Read and process mortality data
-mortality_dataset <- read.csv("datasets/Weekly_Provisional_Counts_of_Deaths_by_State_and_Select_Causes__2020-2023_20250216.csv", check.names = FALSE)
-
-# Convert Week Ending Date to Date format
-mortality_dataset <- mortality_dataset %>%
-  mutate(`Week Ending Date` = mdy(`Week Ending Date`))
-
 mortality_illinois <- mortality_dataset %>%
   filter(`Jurisdiction of Occurrence` == "Illinois") %>%
   select(all_of(relevant_mortality_columns)) %>%
+  mutate(`Week Ending Date` = ymd(`Week Ending Date`)) %>%
   filter(`Week Ending Date` < ymd("2023-08-01")) %>%
-  mutate(`Non Covid Deaths` = `All Cause` - coalesce(`COVID-19 (U071, Underlying Cause of Death)`, 0))
+  mutate(
+    `Non Covid Deaths` = `All Cause` - coalesce(`COVID-19 (U071, Underlying Cause of Death)`, 0)
+  )
 ```
 
 ## Load and Clean Climate Data
 
 ```{r clean-climate-data}
+# File path to climate data
+climate_path <- "datasets/Climate datasets/Data Cleaning/Climate_weekly_data.csv"
+
+# Read and preprocess
+climate_raw <- read_csv(climate_path)
 col_map <- c(
   AWND = "Average Wind Speed (m/s)",
   DAPR = "Number of days included in the multiday precipitation total",
   MDPR = "Multiday precipitation total (mm)",
-  PRCP = "Precipitation (mm)", SNOW = "Snowfall (cm)",
-  SNWD = "Snow Depth (cm)", TAVG = "Average Temperature (C)",
-  TMAX = "Maximum Temperature (C)", TMIN = "Minimum Temperature (C)",
+  PRCP = "Precipitation (mm)",
+  SNOW = "Snowfall (cm)",
+  SNWD = "Snow Depth (cm)",
+  TAVG = "Average Temperature (C)",
+  TMAX = "Maximum Temperature (C)",
+  TMIN = "Minimum Temperature (C)",
   TOBS = "Temperature Observed (C)"
 )
 
-climate_dataset <- read.csv("datasets/Climate datasets/Data Cleaning/Climate_weekly_data.csv") %>%
-  select(Date = Week_Ending_Date, all_of(names(col_map))) %>%
+climate_dataset <- climate_raw %>%
+  rename(Date = Week_Ending_Date) %>%
+  select(Date, all_of(names(col_map))) %>%
   rename_with(~ col_map[.x], .cols = names(col_map)) %>%
-  mutate("Week Ending Date" = ymd(Date)) %>%
+  mutate(`Week Ending Date` = ymd(Date)) %>%
   select(-Date)
 ```
 
 ## Merge Mortality and Climate Data
 
 ```{r merge-data}
+# Inner join on week ending date
 merged_dataset <- inner_join(
   mortality_illinois,
   climate_dataset,
@@ -95,12 +120,12 @@ long_df <- merged_dataset %>%
   pivot_longer(-"Week Ending Date", names_to = "Variable", values_to = "Value")
 
 # Plot with facets and secondary axis per facet is complex; here example for one:
-scale_factor <- max(merged_dataset$`Average Wind Speed (m/s)`) / max(merged_dataset$`Non Covid Deaths`)
+scale_factor <- max(merged_dataset$`Average Temperature (C)`) / max(merged_dataset$`Non Covid Deaths`)
 
 ggplot(merged_dataset, aes(x = `Week Ending Date`)) +
   geom_line(aes(y = `Average Wind Speed (m/s)`)) +
   geom_line(aes(y = `Non Covid Deaths` * scale_factor), color = "red") +
-  labs(x = "Week Ending Date", y = "Average Wind Speed (scaled) and Deaths") +
+  labs(x = "Week Ending Date", y = "Average Temperature (scaled) and Deaths") +
   theme_minimal()
 ```
 
@@ -119,55 +144,59 @@ corrplot(corr_mat, method = "color", type = "upper", tl.cex = 0.8)
 ## Lasso Regression Modeling
 
 ```{r lasso-modeling}
-predictors <- c(
-  "Average Wind Speed (m/s)", "Snowfall (cm)", "Snow Depth (cm)",
-  "Average Temperature (C)",
-  # temperature range
-  sprintf("Temprature Range (C)")
-)
-
-# Add temperature range
+# Create temperature range variable matching original column name
 merged_dataset <- merged_dataset %>%
-  mutate("Temprature Range (C)" = "Maximum Temperature (C)" - "Minimum Temperature (C)")
+  mutate(`Temprature Range (C)` = `Maximum Temperature (C)` - `Minimum Temperature (C)`)
 
-# Split
-data_split <- createDataPartition(merged_dataset$`Non Covid Deaths`, p = 0.8, list = FALSE)
-train_df <- merged_dataset[data_split, ]
-test_df <- merged_dataset[-data_split, ]
-
-# Preprocess: scale
-preProc <- preProcess(train_df[, predictors], method = c("center", "scale"))
-X_train <- predict(preProc, train_df[, predictors])
-X_test <- predict(preProc, test_df[, predictors])
-y_train <- train_df$`Non Covid Deaths`
-y_test <- test_df$`Non Covid Deaths`
-
-# Polynomial features via model.matrix
-poly_formula <- as.formula(paste("~ (", paste(predictors, collapse = " + "), ")^2 -1"))
-X_train_poly <- model.matrix(poly_formula, data = X_train)
-X_test_poly <- model.matrix(poly_formula, data = X_test)
-
-# Lasso CV
-cv_lasso <- cv.glmnet(
-  x = X_train_poly, y = y_train,
-  alpha = 1, nfolds = 5, parallel = FALSE
+# Specify predictors and response
+predictors <- c(
+  "Average Wind Speed (m/s)",
+  "Snowfall (cm)",
+  "Snow Depth (cm)",
+  "Average Temperature (C)",
+  "Temprature Range (C)"
 )
+response <- "Non Covid Deaths"
+
+# Split data
+set.seed(44)
+split_idx <- createDataPartition(merged_dataset[[response]], p=0.8, list=FALSE)
+train_df <- merged_dataset[split_idx, ]
+test_df  <- merged_dataset[-split_idx, ]
+
+# Scale predictors
+preProc <- preProcess(train_df[predictors], method=c("center","scale"))
+X_train <- predict(preProc, train_df[predictors])
+X_test  <- predict(preProc, test_df[predictors])
+y_train <- train_df[[response]]
+y_test  <- test_df[[response]]
+
+# Polynomial feature expansion (degree 2)
+# Use backticks for special column names in formula
+quoted_preds <- sprintf("`%s`", predictors)
+poly_formula <- as.formula(paste("~ (", paste(quoted_preds, collapse = " + "), ")^2 - 1"))
+X_train_poly <- model.matrix(poly_formula, data=X_train)
+X_test_poly  <- model.matrix(poly_formula, data=X_test)
+
+# Fit Lasso with cross-validation
+devnull <- require(glmnet)
+cv_lasso <- cv.glmnet(x = X_train_poly, y = y_train, alpha = 1, nfolds = 5)
 
 # Predictions
-y_train_pred <- predict(cv_lasso, X_train_poly, s = "lambda.min")
-y_test_pred <- predict(cv_lasso, X_test_poly, s = "lambda.min")
+y_train_pred <- predict(cv_lasso, s = "lambda.min", newx = X_train_poly)
+y_test_pred  <- predict(cv_lasso, s = "lambda.min", newx = X_test_poly)
 
-# Metrics
+# Compute metrics
 train_rmse <- sqrt(mean((y_train - y_train_pred)^2))
-test_rmse <- sqrt(mean((y_test - y_test_pred)^2))
+test_rmse  <- sqrt(mean((y_test  - y_test_pred )^2))
+train_r2   <- cor(y_train, y_train_pred)^2
+test_r2    <- cor(y_test,  y_test_pred )^2
 
-train_r2 <- cor(y_train, y_train_pred)^2
-test_r2 <- cor(y_test, y_test_pred)^2
-
-train_rmse
-test_rmse
-train_r2
-test_r2
+# Print results
+cat("Train RMSE:", train_rmse, "\n")
+cat("Test RMSE:", test_rmse, "\n")
+cat("Train R2:", train_r2, "\n")
+cat("Test R2:", test_r2, "\n")
 ```
 
 ## Prophet Forecasting
@@ -196,60 +225,209 @@ head(perf)
 ## XGBoost Modeling with Grid Search
 
 ```{r xgb-tuning}
-# Prepare data matrices
-train_mat <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
-test_mat <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+# Ensure syntactically valid column names for caret
+colnames(X_train) <- make.names(colnames(X_train))
+colnames(X_test)  <- make.names(colnames(X_test))
 
-# Grid
-param_grid <- expand.grid(
-  nrounds = c(100, 200, 300),
-  eta = c(0.05, 0.1),
-  max_depth = c(3, 5, 7),
-  subsample = c(0.8, 1.0),
-  colsample_bytree = 1,
-  min_child_weight = 1
+# Prepare train control for 5-fold CV
+train_control <- trainControl(method = "cv", number = 5)
+
+# Define tuning grid (must include gamma for xgbTree)
+xgb_grid <- expand.grid(
+  nrounds           = c(100, 200, 300),
+  max_depth         = c(3, 5, 7),
+  eta               = c(0.05, 0.1),
+  gamma             = 0,
+  colsample_bytree  = 1,
+  min_child_weight  = 1,
+  subsample         = c(0.8, 1.0)
 )
 
-control <- trainControl(method = "cv", number = 5)
-
+# Train XGBoost model via caret
 xgb_train <- train(
-  x = X_train, y = y_train,
-  method = "xgbTree",
-  trControl = control,
-  tuneGrid = param_grid,
-  metric = "RMSE"
+  x          = X_train,
+  y          = y_train,
+  method     = "xgbTree",
+  trControl  = train_control,
+  tuneGrid   = xgb_grid,
+  metric     = "RMSE"
 )
 
+# View best tuning parameters
 xgb_train$bestTune
 ```
 
 ## Final XGBoost Model and Evaluation
 
 ```{r xgb-final}
-final_model <- xgb_train$finalModel
+# Predict using caret model
+train_pred_xgb <- predict(xgb_train, newdata = X_train)
+test_pred_xgb  <- predict(xgb_train, newdata = X_test)
 
-y_train_xgb <- predict(final_model, X_train)
-y_test_xgb <- predict(final_model, X_test)
+# Compute performance metrics using caret's postResample
+train_metrics <- postResample(pred = train_pred_xgb, obs = y_train)
+test_metrics  <- postResample(pred = test_pred_xgb,  obs = y_test)
 
-rmse(y_train, y_train_xgb)
-rmse(y_test, y_test_xgb)
-r2(y_train, y_train_xgb)
-r2(y_test, y_test_xgb)
+cat("Training RMSE:", train_metrics["RMSE"], "
+")
+cat("Training R2:", train_metrics["Rsquared"], "
+")
+cat("Test RMSE:", test_metrics["RMSE"], "
+")
+cat("Test R2:", test_metrics["Rsquared"], "
+")
 ```
 
 ## Feature Importance and Predictions Plotting
 
 ```{r xgb-results}
-# Importance
-importance_matrix <- xgb.importance(feature_names = colnames(X_train), model = final_model)
-xgb.plot.importance(importance_matrix)
+# Extract feature importance from the caret-trained XGBoost model
+var_imp <- xgb.importance(
+  feature_names = colnames(X_train),
+  model = xgb_train$finalModel
+)
 
-# Predictions vs Actual
+# Plot importance
+xgb.plot.importance(var_imp)
+
+# Prepare full dataset predictions
+full_features <- predict(preProc, merged_dataset[predictors])
+# Ensure column names are valid
+colnames(full_features) <- make.names(colnames(full_features))
+# Generate predictions
+full_pred <- predict(xgb_train, newdata = full_features)
+
+# Combine actuals and predictions
 plot_df <- merged_dataset %>%
-  mutate(pred_xgb = predict(final_model, as.matrix(predict(preProc, merged_dataset[, predictors]))))
+  mutate(pred_xgb = full_pred)
 
+# Plot actual vs. predicted
 ggplot(plot_df) +
-  geom_line(aes(x = "Week Ending Date", y = "Non Covid Deaths"), color = "blue") +
-  geom_line(aes(x = "Week Ending Date", y = pred_xgb), color = "red") +
-  labs(title = "XGBoost: Actual vs Predicted")
+  geom_line(aes(x = `Week Ending Date`, y = `Non Covid Deaths`), color = "blue") +
+  geom_line(aes(x = `Week Ending Date`, y = pred_xgb), color = "red") +
+  labs(
+    title = "XGBoost: Actual vs Predicted",
+    x = "Week Ending Date",
+    y = "Non Covid Deaths"
+  ) +
+  theme_minimal()
 ```
+
+## Merge Socioeconomic Data
+
+```{r socio-merge}
+# Load socioeconomic datasets
+dp05 <- read_csv("datasets/Census/DP05/processed/DP05_combined.csv") %>% mutate(Date = ymd(Date))
+s1401 <- read_csv("datasets/Census/S1401/processed/S1401_combined.csv") %>% mutate(Date = ymd(Date))
+s2503 <- read_csv("datasets/Census/S2503/processed/S2503_combined.csv") %>% mutate(Date = ymd(Date))
+
+# Merge on Date
+library(purrr)
+merged_socioeconomic <- list(dp05, s1401, s2503) %>%
+  reduce(inner_join, by = "Date")
+
+# Combine with mortality-climate data
+complete_dataset <- merged_dataset %>%
+  inner_join(merged_socioeconomic, by = c("Week Ending Date" = "Date"))
+```
+
+## Extended Lasso Regression on Combined Dataset
+
+```{r lasso-extended}
+# Select relevant columns
+ext_features <- c(
+  "Average Wind Speed (m/s)", "Precipitation (mm)", "Snowfall (cm)",
+  "Snow Depth (cm)", "Average Temperature (C)", "Temprature Range (C)",
+  "Total population", "Sex ratio", "Median age", "Under 18 years",
+  "18 years and over", "62 years and over", "Total housing units",
+  "Total enrolled in school", "Nursery school, preschool",
+  "Kindergarten to 12th grade", "Kindergarten", "Elementary",
+  "Middle school", "High school", "College, undergraduate",
+  "Graduate, professional school", "Median_household_income",
+  "Median_housing_costs"
+)
+response <- "Non Covid Deaths"
+
+# Prepare X and y
+X_ext <- complete_dataset %>% select(all_of(ext_features))
+y_ext <- complete_dataset[[response]]
+
+# Scale
+preProc_ext <- preProcess(X_ext, method = c("center","scale"))
+X_ext_scaled <- predict(preProc_ext, X_ext)
+
+# Polynomial expansion
+ticked_feats <- sprintf("`%s`", ext_features)
+poly_formula_ext <- as.formula(paste("~ (", paste(ticked_feats, collapse = " + "), ")^2 - 1"))
+X_ext_poly <- model.matrix(poly_formula_ext, data = X_ext_scaled)
+
+# Lasso CV
+devnull <- require(glmnet)
+cv_lasso_ext <- cv.glmnet(x = X_ext_poly, y = y_ext, alpha = 1, nfolds = 10)
+
+# Predictions and metrics
+y_ext_pred <- predict(cv_lasso_ext, s = "lambda.min", newx = X_ext_poly)
+r2_ext  <- cor(y_ext, y_ext_pred)^2
+n_ext   <- nrow(X_ext_poly)
+p_ext   <- sum(coef(cv_lasso_ext, s="lambda.min") != 0) - 1
+adj_r2_ext <- 1 - (1 - r2_ext) * (n_ext - 1)/(n_ext - p_ext - 1)
+rmse_ext <- sqrt(mean((y_ext - y_ext_pred)^2))
+mae_ext  <- mean(abs(y_ext - y_ext_pred))
+
+# Output
+cat("Selected Features:", paste(names(which(coef(cv_lasso_ext, s="lambda.min") != 0))[-1], collapse=", "), "
+")
+cat("Best alpha:", cv_lasso_ext$lambda.min, "
+")
+cat("R²:", round(r2_ext,3), "
+")
+cat("Adjusted R²:", round(adj_r2_ext,3), "
+")
+cat("RMSE:", round(rmse_ext,3), "
+")
+cat("MAE:", round(mae_ext,3), "
+")
+```
+
+## Extended XGBoost on Combined Dataset
+
+```{r xgb-extended}
+# Split extended data
+set.seed(42)
+split_ext <- createDataPartition(y_ext, p = 0.8, list = FALSE)
+X_train_ext <- X_ext_scaled[split_ext, ]
+X_test_ext  <- X_ext_scaled[-split_ext, ]
+y_train_ext <- y_ext[split_ext]
+y_test_ext  <- y_ext[-split_ext]
+
+# Train with caret using existing grid and control
+xgb_train_ext <- train(
+  x = X_train_ext,
+  y = y_train_ext,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  metric = "RMSE"
+)
+
+# Predictions & metrics
+t_pred_ext <- predict(xgb_train_ext, newdata = X_train_ext)
+te_pred_ext <- predict(xgb_train_ext, newdata = X_test_ext)
+train_ext_metrics <- postResample(t_pred_ext, y_train_ext)
+test_ext_metrics  <- postResample(te_pred_ext,  y_test_ext)
+
+cat("Extended Train RMSE:", train_ext_metrics["RMSE"], "
+")
+cat("Extended Train R2:", train_ext_metrics["Rsquared"], "
+")
+cat("Extended Test RMSE:", test_ext_metrics["RMSE"], "
+")
+cat("Extended Test R2:", test_ext_metrics["Rsquared"], "
+")
+
+# Feature importance
+imp_ext <- varImp(xgb_train_ext)
+plot(imp_ext, top = 10)
+```
+
+
